@@ -27,19 +27,20 @@ You agree:
 '''
 
 #This is the path for the python interpreter.  You must set it before this will run.  If you are unsure what this is, try the command "which python3" or "which pypy3" and try pasting the path returned between the quotes on the next line.
-global pythonInterpreterAbsolutePath
-pythonInterpreterAbsolutePath = ""  #Set the absolute path for your python interpreter here between the quotes.  Depending on your system configuration, you may also be able to use a shortcut, such as python3, but that has a greater chance of errors
-    
+global pythonInterpreterAbsolutePath; global pythonCompilerAbsolutePath
+pythonInterpreterAbsolutePath = ""
+
 #USEFUL DEFAULT SETTINGS HERE
 global selectionModeTargetLimitPerJob
 selectionModeTargetLimitPerJob = 0 #This prevents a user from submitting a job with too many target sites that might overload or degrade performance on the system.  Clobber mode can override this.  Change this value according to your system's capabilities.  Set to 0 or negative value for no limit.
 
-global clusterDefaultSelectionModeParallelJobLimit; global standAloneDefaultSelectionModeParallelJobLimit
+global clusterDefaultSelectionModeParallelJobLimit; global standAloneDefaultSelectionModeParallelJobLimit; global clusterMaxArrayJobs;
 clusterDefaultSelectionModeParallelJobLimit = 230  #Limit on how many simultaneous parallel jobs can be going at once on a cluster (set this based on the limit for how many queued items you can have)
-standAloneDefaultSelectionModeParallelJobLimit = 64  #Limit on how many simultaneous parallel jobs can be going if run on a single system.  Change according to your machine.
+standAloneDefaultSelectionModeParallelJobLimit = 1  #Limit on how many simultaneous parallel jobs can be going if run on a single system.  Change according to your machine.
+clusterMaxArrayJobs = 100  #for an array job, this is the maximum number of crispr sites that can be in a single sequence if there is no selectionModeTargetLimitPerJob set.
 
 global currentVersion
-currentVersion = "2.0.1"
+currentVersion = "2.0.4"
 
 global versionName
 versionName = "GuideSeq Divided... I never asked for this"
@@ -139,7 +140,7 @@ class Args(object):
         parser.add_argument ("-d", "--inputDirectory", help = "Specify genome index directory for a worker job.")
         parser.add_argument ("-f", "--inputfile", help = "Specify a single input file for splitting")
         parser.add_argument ("--tempDir", help = "Temporary directory name for parallel jobs")
-        parser.add_argument ("-p", "--parallelJobs", help = "Max number of parallel jobs at once. (Or per search if running in selection mode)")
+        parser.add_argument ("--parallelJobs", help = "Max number of parallel jobs at once. (Or per search if running in selection mode)")
         parser.add_argument ("-9", "--clobber", help = "Do not ask before overwriting files.", action = 'store_true')
         parser.add_argument ("-w", "--workerID", help = "Worker process ID.  Users should not be setting this value.")
         parser.add_argument ("-s", "--sequence", help = "Sequence of interest.  Format: NNNNNNGUIDERNANNNNNN_PAM")
@@ -169,52 +170,84 @@ class Args(object):
         parser.add_argument ("--scratchFolder", help = "Specify a directory to use for writing temporary (job) folders.")
         parser.add_argument ("--cluster", help = "Specify that this is running on a cluster system.", action = "store_true")
         parser.add_argument ("--standAlone", "--standalone", help = "Specify that this is running on a single system or server.", action = "store_true")
+        parser.add_argument ("--mixed", help = "In selection mode, run each site on a separate node, but parallelize searching within a single node.", action = "store_true")
         parser.add_argument ("--directToCompiler", help = "If you already have run the index, but compiling did not complete successfully, try this to recompile.", action = "store_true")
         parser.add_argument ("--recreateTree", help = "Recreate the tree pickle for an existing genome index.", action = "store_true")
         parser.add_argument ("--bins", help = "Pass a comma-separated list of bins for this compiler instance to work on.")
         parser.add_argument ("--treeLevel1", help = "Pass an integer value for the first level of the tree")
         parser.add_argument ("--treeLevel2", help = "Pass an integer value for the second level of the tree")
+        parser.add_argument ("-p", "--preferredPAM", help = "Use this to pass a preferred PAM site for a selection job" )
+        parser.add_argument ("--arrayJob", help = "This will be used by a selection hypervisor to initiate array jobs", action = "store_true")
+        parser.add_argument ("-a", "--useArray", help = "Use array jobs on an SGE cluster in mixed mode (recommended if possible, this will turn on mixed mode automatically)", action = "store_true")
+        parser.add_argument ("--delayIO", help = "Delay search worker IO calls by a random time to avoid IO traffic jams.", action = "store_true")
+        parser.add_argument ("--totalArrayJobs", help = "Total number of array jobs for this run, used by the array job launcher.")
+        parser.add_argument ("--spoofTaskID", help = "Pass an integer to force a task ID (rather than pulling one from environment variables).  Used for debugging and testing the array job runner.")
         args = parser.parse_args()  #puts the arguments into the args object
-        
-        if args.standAlone and args.cluster: #You really can't be both.
-            raise RuntimeError("Aborted: You must specify either --cluster or --standAlone.  You can't be both.")
-        if not (args.standAlone or args.cluster or args.manual) and args.mode in ['search', 'index', 'selection']:
-            raise RuntimeError("ABORTED: You must specify if this will be running on a stand-alone system or a cluster. (--standAlone or --cluster)")
+       
+        if args.arrayJob:  #quick trap for array job runners... it will be run during the checkargs phase and return to the main function where it will report itself done and quit
+            if not args.tempDir:
+                raise RuntimeError("Unable to run array job without being passed the name of the temporary directory under --tempDir.")
+            try:
+                totalArrayJobs = int(args.totalArrayJobs)
+            except ValueError:
+                raise RuntimeError("Argument passed as --totalArrayJobs must be an integer. " + str(args.totalArrayJobs) + " was passed instead.")
+            spoofTaskID = False
+            if args.spoofTaskID:
+                try:
+                    spoofTaskID = int(args.spoofTaskID)
+                except ValueError:
+                    raise RuntimeError("Spoofed task ID must be passed as an integer.  We got: " + str(args.spoofTaskID))
+            arrayJobTrap(args.tempDir, totalArrayJobs, spoofTaskID)
+            
+            self.mode = "ARRAY RUNNER"
         else:
-            if args.standAlone:
-                self.standAlone = True
-                self.cluster = False
-            if args.cluster:
-                self.cluster = True
-                self.standAlone = False
-        if not args.mode and not args.manual:  #series of case statements for mode to determine which set of inputs to validate.  If no mode was set, it will see if the user is asking for the manual.  
-            raise RuntimeError("ABORTED: No run mode was set on the commandline.")
-        self.mode = args.mode
-        if not args.genomeDirectory:
-            self.genomeListDirectory = "genomes/"
-        else:
-            self.genomeListDirectory = args.genomeDirectory
-            if not self.genomeListDirectory[-1] == "/":
-                self.genomeListDirectory += "/"
-            if not os.path.isdir(self.genomeListDirectory) and not self.mode == 'index':
-                raise RuntimeError("ABORTED: User-specified genome: " + self.genomeListDirectory + " not found.")
-        if args.mode == 'worker':
-            self.setWorkerArgs(args)
-        elif args.mode == 'search':
-            self.setSearchArgs(args)
-        elif args.mode == 'index':
-            self.setIndexArgs(args)
-        elif args.mode == 'FASTAWorker':
-            self.setFASTAWorkerArgs(args)
-        elif args.mode == 'selection':
-            self.setSelectionArgs(args)
-        elif args.mode == 'compiler':
-            self.setCompilerArgs(args)
-        elif args.manual:
-            printManual()
-            quit()
-        else:
-            raise RuntimeError('ABORTED: Invalid/no mode set on commandline.  Please select a mode or run with --manual set for assistance.')
+            if (args.standAlone and args.cluster) or (args.mixed and args.cluster) or (args.mixed and args.standAlone): #You really can't be both.
+                raise RuntimeError("Aborted: You must specify --cluster OR --standAlone OR --mixed.  You can't be more than one.")
+            if not (args.standAlone or args.cluster or args.mixed or args.manual) and args.mode in ['search', 'index', 'selection']:
+                raise RuntimeError("ABORTED: You must specify if this will be running on a stand-alone system or a cluster. (--standAlone or --cluster)")
+            else:
+                if args.standAlone:
+                    self.standAlone = True
+                    self.cluster = False
+                    self.mixed = False
+                elif args.cluster:
+                    self.cluster = True
+                    self.standAlone = False
+                    self.mixed = False
+                elif args.mixed:
+                    self.cluster = False
+                    self.standAlone = False
+                    self.mixed = True
+                    if args.mode and args.mode.upper() == "INDEX":
+                        raise RuntimeError("Mixed system cannot be specified for an index run.")
+            if not args.mode and not args.manual:  #series of case statements for mode to determine which set of inputs to validate.  If no mode was set, it will see if the user is asking for the manual.  
+                raise RuntimeError("ABORTED: No run mode was set on the commandline.")
+            self.mode = args.mode
+            if not args.genomeDirectory:
+                self.genomeListDirectory = "genomes/"
+            else:
+                self.genomeListDirectory = args.genomeDirectory
+                if not self.genomeListDirectory[-1] == "/":
+                    self.genomeListDirectory += "/"
+                if not os.path.isdir(self.genomeListDirectory) and not self.mode == 'index':
+                    raise RuntimeError("ABORTED: User-specified genome: " + self.genomeListDirectory + " not found.")
+            if args.mode == 'worker':
+                self.setWorkerArgs(args)
+            elif args.mode == 'search':
+                self.setSearchArgs(args)
+            elif args.mode == 'index':
+                self.setIndexArgs(args)
+            elif args.mode == 'FASTAWorker':
+                self.setFASTAWorkerArgs(args)
+            elif args.mode == 'selection':
+                self.setSelectionArgs(args)
+            elif args.mode == 'compiler':
+                self.setCompilerArgs(args)
+            elif args.manual:
+                printManual()
+                quit()
+            else:
+                raise RuntimeError('ABORTED: Invalid/no mode set on commandline.  Please select a mode or run with --manual set for assistance.')
             
     def setSelectionArgs(self, args):  #validating and setting arguments for selection of targets from a user-provided sequence
         import os
@@ -280,7 +313,7 @@ class Args(object):
             self.skipAzimuth = args.skipAzimuth
         self.noCleanup = args.noCleanup
         if not args.parallelJobLimit:
-            if self.cluster:
+            if self.cluster or self.mixed:
                 self.maxParallelJobs = clusterDefaultSelectionModeParallelJobLimit  #set this value at the top of the script for your configuration of choice
             if self.standAlone:
                 self.maxParallelJobs = standAloneDefaultSelectionModeParallelJobLimit
@@ -307,7 +340,41 @@ class Args(object):
                 except OSError:
                     if not os.path.isdir(self.scratchFolder):  #This could happen because of a data race type condition, if one process creates the directory after this one checks for it, but before it creates it.  This will catch that problem.
                         raise RuntimeError("ABORTED: Unable to create scratch folder.  Check if directory containing this folder already exists.")
-            
+        self.preferredPAM = False
+        self.preferredPAMWeight = False
+        if args.preferredPAM:
+            if "," in args.preferredPAM:
+                if not args.preferredPAM.count(",") == 1:
+                    raise RuntimeError("PreferredPAM argument can be passed with only one comma-separated value for SITE,PREFERENCEVALUE.  Passed value was " + args.preferredPAM)
+                self.preferredPAM, self.preferredPAMWeight = args.preferredPAM.split(",")
+                try:
+                    self.preferredPAMWeight = int(self.preferredPAMWeight)
+                except ValueError:
+                    try:
+                        self.preferredPAMWeight = float(self.preferredPAMWeight)
+                    except:
+                        raise RuntimeError("PreferredPAM argument must be a number.  Program was passed " + self.preferredPAMWeight + " in preferredPAM argument " + args.preferredPAM)
+            else:
+                self.preferredPAM = args.preferredPAM.upper()
+                self.preferredPAMWeight = False
+            systemPAM = self.sequence.split("_")[1]
+            systemPAMList = NondegenerateBases(systemPAM).permutations()
+            self.preferredPAMList = NondegenerateBases(self.preferredPAM).permutations()
+            for preferredSite in self.preferredPAMList:
+                if not preferredSite in systemPAMList:
+                    raise RuntimeError("ABORTED: Your preferred PAM site of " + self.preferredPAM + " is not a subset for the system PAMs of " + systemPAM + ".")
+        self.useArray = False
+        if args.useArray:
+            if not self.mixed:
+                if self.standAlone:
+                    raise RuntimeError("Array mode is invalid in stand alone mode.  Please run in mixed mode and try again.")
+                self.mixed = True
+                self.cluster = False
+                print("Array use must be done in mixed mode to avoid overloading the job scheduler.")
+                if not yesAnswer("Change to mixed mode now?"):
+                    quit("Ok, exiting.")
+            self.useArray = True
+    
     def setWorkerArgs(self, args):  #Validating arguments for a search worker.  This should not require too much validation, as users should not be launching worker processes themselves
         self.mode = "worker"
         self.workerID = args.workerID
@@ -317,6 +384,9 @@ class Args(object):
         self.inputDirectory = args.inputDirectory
         self.verbose = args.verbose
         self.skipAzimuth = True
+        self.delayIO = False
+        if args.delayIO:
+            self.delayIO = True
            
     def setSearchArgs(self, args):  #Validating arguments for launching a search supervisor.  This will require good validations, as users are likely to be launching this on their own.
         import os
@@ -349,7 +419,7 @@ class Args(object):
             except ValueError:
                 raise RuntimeError("ABORTED: Parallel jobs argument must be an integer")
         else:
-            self.parallelJobs = 5
+            self.parallelJobs = 12
         self.outputDirectory = args.outputDirectory
         self.noCleanup = args.noCleanup
         self.forceGenome = args.forceGenome
@@ -379,6 +449,36 @@ class Args(object):
         self.clobber = False
         if args.clobber:
             self.clobber = True
+        self.preferredPAM = False
+        self.preferredPAMWeight = False
+        if args.preferredPAM:
+            if "," in args.preferredPAM:
+                if not args.preferredPAM.count(",") == 1:
+                    raise RuntimeError("PreferredPAM argument can be passed with only one comma-separated value for SITE,PREFERENCEVALUE.  Passed value was " + args.preferredPAM)
+                self.preferredPAM, self.preferredPAMWeight = args.preferredPAM.split(",")
+                try:
+                    self.preferredPAMWeight = int(self.preferredPAMWeight)
+                except ValueError:
+                    try:
+                        self.preferredPAMWeight = float(self.preferredPAMWeight)
+                    except:
+                        raise RuntimeError("PreferredPAM argument must be a number.  Program was passed " + self.preferredPAMWeight + " in preferredPAM argument " + args.preferredPAM)
+            else:
+                self.preferredPAM = args.preferredPAM.upper()
+                self.preferredPAMWeight = False
+            systemPAM = self.sequence.split("_")[1]
+            self.preferredPAMList = NondegenerateBases(self.preferredPAM).permutations()
+            if not self.forceGenome:  #if we have a forceGenome argument, this is a subprocess of a selection job and this has already been checked.  It will also fail, since a nondegenerate PAM will be passed.
+                systemPAMList = NondegenerateBases(systemPAM).permutations()
+                for preferredSite in self.preferredPAMList:
+                    if not preferredSite in systemPAMList:
+                        raise RuntimeError("ABORTED: Your preferred PAM site of " + self.preferredPAM + " is not a subset for the system PAMs of " + systemPAM + ".")
+        self.useArray = False
+        if args.useArray:
+            self.useArray = True
+        self.delayIO = False
+        if args.delayIO:
+            self.delayIO = True
 
     def setIndexArgs(self, args):  #Validating arguments for launching an indexing supervisor.  This will also require good validations as users are likely to be launching this on their own.
         import os
@@ -542,6 +642,47 @@ class Args(object):
         if args.noCleanup:
             self.noCleanup = True
 
+#=================================================SGE Array Job trapper==============================================================================
+
+def arrayJobTrap(tempDir, totalArrayJobs, spoofTaskID):
+    import os
+    import pickle
+    import time
+    import random
+    if not spoofTaskID:
+        try:
+            thisJob = int(os.environ["SGE_TASK_ID"])   #Yes, yes, this is a fertile job and we will thrive.  We will rule over all this job and we will call it... thisJob.
+        except KeyError:   #I think we should call it your unhandled exception
+            raise RuntimeError("Unable to find a valid task ID in OS environment variables.")  #Arghhh... curse your sudden but inevitable betrayal!
+    else:
+        thisJob = int(spoofTaskID)
+    random.seed(thisJob)
+    sleepyTime = random.uniform(0,totalArrayJobs/1.5)  #stagger the starts of these jobs to control how much simultaneous IO we run
+    print("Random hold for " + str(sleepyTime) + " seconds to avoid overloading the IO system.")
+    time.sleep(sleepyTime)
+    jobArrayFilePath = tempDir
+    if not tempDir.endswith(os.sep):
+        jobArrayFilePath += os.sep
+    jobArrayFilePath += "jobArray.pkl"
+    try:
+        jobArrayFile = open(jobArrayFilePath,"rb")
+    except FileNotFoundError:
+        raise RuntimeError("Unable to find job array file at " + jobArrayFile)
+    except:  #Any error besides a missing file could be due to excessive simultaneous access.  If so, wait some random amount of time and try again
+        try:
+            jobArrayFile = open(jobArrayFilePath,"rb")
+        except:  #Give it one more shot.  If it still fails, we probably have a serious problem on our hands want an unhandled exception.
+            jobArrayFile = open(jobArrayFilePath,"rb")
+    jobArray = pickle.load(jobArrayFile)
+    jobArrayFile.close()
+    try:
+        bashFileList = jobArray[thisJob - 1]  #Subtract 1 because python indexes to 0 while the SGE scheduler indexes to 1
+    except IndexError:
+        raise RuntimeError("Tried to run job number " + str(thisJob) + " from the job array at " + jobArrayFilePath + ".  It was not found.")
+    print("Running array job number " + str(thisJob - 1))
+    for bashFilePath in bashFileList:
+        os.system("bash " + bashFilePath)
+    
 #=================================================Sequence target analysis/hypervisor objects=================================================================================================================================
 
 class TargetSite(object):  #This object holds attributes that describe a potential target site found in the user-defined target sequence.  This can be extended as we get better ways to describe potential target sites.  Only needs a cut site sequence to be initialized, all else can be set later.
@@ -572,6 +713,8 @@ class TargetFinder(object):  #This object is analogous to a FASTA indexer, excep
         self.start = 0  #start is inclusive
         self.end = self.cutWindow
         self.guide, self.pam = args.sequence.split("_")
+        if args.preferredPAM:
+            self.pam = args.preferredPAM  #If the user specified an optimal PAM sequence, we will use that instead.  It will still probably be degenerate, but a bit more restricted.
         self.pamList = NondegenerateBases(self.pam).permutations()
         self.pamLength = len(self.pam)
         self.matches = []  #initialize an empty list to hold our match sites (which will be TargetSite class instances)
@@ -742,8 +885,13 @@ class TargetSelection(object):  #This is the main running object for the target 
             raise RuntimeError("ABORTED: Too many targets in sequence.  Try running a shorter target sequence, a more specific Crispr system, or using clobber mode (argument -9) to override this.")
         print("Found " + str(len(self.targetList)) + " potential target sites.")
         self.createTempDir()
-        self.createJobList()
-        self.runJobList()
+        if not args.useArray:
+            self.createJobList()
+            self.runJobList()
+        else:
+            self.createJobArray()
+            self.runJobArray()
+            self.monitorJobArray()
         self.gatherResults()
         self.sortResults()
         if not args.outputToFile:
@@ -861,7 +1009,10 @@ class TargetSelection(object):  #This is the main running object for the target 
         import os
         import time
         self.submittedJob = 1
-        maxSimultaneousJobs = args.maxParallelJobs // args.parallelJobs
+        if not args.mixed:
+            maxSimultaneousJobs = args.maxParallelJobs // args.parallelJobs
+        else:
+            maxSimultaneousJobs = args.maxParallelJobs #because now each site is a single parallel job run on a single node
         while self.jobList['queued'] or self.jobList['running']:
             try:
                 while self.jobList['queued'] and len(self.jobList['running']) < maxSimultaneousJobs:
@@ -890,7 +1041,7 @@ class TargetSelection(object):  #This is the main running object for the target 
                     if yesAnswer("Continue with run?"):
                         continue
                     else:
-                        raise RuntimeError("ABORTED: By your command.")
+                        quit("ABORTED: By your command.")
                     
     def createJobBash(self, job):  #Creates a bash file to submit for running the job
         self.bash = self.tempDir + "/" + str(job.cutSeq) + ".sh"
@@ -906,14 +1057,24 @@ class TargetSelection(object):  #This is the main running object for the target 
             systemInfo = " --cluster "
         if args.standAlone:
             systemInfo = " --standAlone "
-        #bashFile.write("module load python/3.4\n")
-        bashFile.write(pythonInterpreterAbsolutePath + " dsNickFury" + currentVersion + ".py --mode search --mismatchTolerance " + str(args.mismatchTolerance) + clobber + " --sequence " + job.cutSeq + " --forceGenome " + self.indexedGenome + " --outputDirectory " + self.tempDir + " --parallelJobs " + str(args.parallelJobs) + " --mismatchTolerance " + str(args.mismatchTolerance) + " --genomeDirectory " + args.genomeListDirectory.replace(" ",'\ ') + " --azimuthSequence " + str(job.longSeq) + scratchFolder + systemInfo + "\n")
+        if args.mixed:
+            systemInfo = " --mixed "
+        if args.useArray:
+            delayIO = " --delayIO"
+        else:
+            delayIO = ""
+        preferredPAMArg = ""
+        if args.preferredPAM:
+            preferredPAMArg = " --preferredPAM " + args.preferredPAM
+            if args.preferredPAMWeight:
+                preferredPAMArg += "," + str(args.preferredPAMWeight)
+        bashFile.write(pythonInterpreterAbsolutePath + " dsNickFury" + currentVersion + ".py --mode search --mismatchTolerance " + str(args.mismatchTolerance) + clobber + delayIO + preferredPAMArg +" --sequence " + job.cutSeq + " --forceGenome " + self.indexedGenome + " --outputDirectory " + self.tempDir + " --parallelJobs " + str(args.parallelJobs) + " --mismatchTolerance " + str(args.mismatchTolerance) + " --genomeDirectory " + args.genomeListDirectory.replace(" ",'\ ') + " --azimuthSequence " + str(job.longSeq) + scratchFolder + systemInfo + "\n")
         bashFile.close()
     
     def submitJob(self, job):  #submits the bash file to the queue scheduler
         shortName = "ShieldHQ" + str(self.submittedJob)
         self.submittedJob += 1
-        if args.cluster:
+        if args.cluster or args.mixed:
             import os
             command = "qsub -cwd -V -N " + shortName + " -l h_data=2G,time=23:59:00 -e " + os.getcwd() +  "/schedulerOutput/ -o " + os.getcwd() + "/schedulerOutput/ " + self.bash
             if not args.mock:
@@ -934,11 +1095,75 @@ class TargetSelection(object):  #This is the main running object for the target 
             command = "bash " + self.bash
             if not args.mock:
                import subprocess
+               import time
                subprocess.Popen(command, shell = True)
+               print("Holding for 5 seconds.")
+               time.sleep(5) #First thing the search supervisor will do is load the tree pickle file.  This can degrade performance if they ALL try to load the same file simultaneously.
             else:
                 print ("MOCK SUBMIT: " + command)
+
+    def createJobArray(self):
+        self.jobArray = []
+        if len(self.targetList) <= clusterMaxArrayJobs:
+            for targetSite in self.targetList:
+                self.createJobBash(targetSite)
+                self.jobArray.append([self.bash])
+        else:
+            for i in range(0, clusterMaxArrayJobs):
+                self.jobArray.append([])
+            for i in range(0, len(self.targetList)):
+                self.createJobBash(self.targetList[i])
+                self.jobArray[i % clusterMaxArrayJobs].append(self.bash)          
             
+    def runJobArray(self):
+        import os
+        import time
+        import pickle
+        jobArrayFilePath = self.tempDir + os.sep + "jobArray.pkl"
+        jobArrayFile = open(jobArrayFilePath,'wb')
+        pickle.dump(self.jobArray, jobArrayFile)
+        jobArrayFile.close()
+        arrayRunnerBashFilePath = self.tempDir + os.sep + "arrayRunner.sh"
+        arrayRunnerBashFile = open(arrayRunnerBashFilePath, 'w')
+        arrayRunnerBashFile.write("#!/bin/bash\n")
+        arrayRunnerBashFile.write(pythonInterpreterAbsolutePath + " dsNickFury" + currentVersion + ".py --arrayJob --tempDir " + self.tempDir + " --totalArrayJobs " + str(len(self.jobArray)))
+        arrayRunnerBashFile.close()
+        jobRange = " 1-" + str(len(self.jobArray)) + " "
+        command = "qsub -cwd -V -N ShieldHQ -l h_data=2G,time=23:59:00 -pe shared 2 -e " + os.getcwd() +  "/schedulerOutput/ -o " + os.getcwd() + "/schedulerOutput/ " + "-t " + jobRange + arrayRunnerBashFilePath
+        if not args.mock:
+            failedSubmissions = 0
+            submitted = False
+            while not submitted and failedSubmissions < 10:
+                submission = os.system(command)
+                if not submission == 0:
+                    print("Job submission unsuccessful, waiting 5 seconds and resubmitting.")
+                    failedSubmissions += 1
+                    time.sleep(5)
+                    continue
+                else:
+                    submitted = True
+        else:
+            print ("MOCK SUBMIT: " + command)
             
+    def monitorJobArray(self):
+        import time
+        import os
+        jobMonitorArray = []
+        for item in self.targetList:
+            jobMonitorArray.append([item.cutSeq, False])  #each item added to this array will be the job identifier in the first index (0) and a boolean indicating it is done.  Lacking easy access to a TARDIS, we can assume no job is completed before it starts.  Should this change, it will still work anyway.
+        totalJobs = len(jobMonitorArray)
+        completedJobs = 0  #again, the TARDIS thing
+        print("Waiting for " + str(totalJobs - completedJobs) + " of " + str(totalJobs) + " sites to complete.           ", end = "\r")
+        while completedJobs < totalJobs:  #if it becomes greater, we have a problem
+            for i in range(0, totalJobs):
+                if not jobMonitorArray[i][1]: #if we already know it's done, we don't need to check again
+                    if os.path.isfile(self.tempDir + os.sep + "completed" + os.sep + jobMonitorArray[i][0]):
+                        jobMonitorArray[i][1] = True
+                        completedJobs += 1
+            print("Waiting for " + str(totalJobs - completedJobs) + " of " + str(totalJobs) + " sites to complete.           ", end = "\r")
+            time.sleep(1)
+        print("\nCompleted!  Reporting results.")
+                    
     def gatherResults(self):  #gathers the results from the worker processes (passed via pickle), checks for unacceptable sites (ones that have perfect matches in multiple genomic locations), and calculates mismatch risk numbers
         import pickle
         for i in range(0,len(self.targetList)):
@@ -955,7 +1180,7 @@ class TargetSelection(object):  #This is the main running object for the target 
                     if site.gene != first:
                         self.targetList[i].acceptable = False
                         break
-            if self.targetList[i].matches[0][0].tooManyOtherSites:
+            if self.targetList[i].matches[0][0].tooManyOtherSites:    
                 self.targetList[i].tooManyMatches = self.targetList[i].matches[0][0].tooManyOtherSites
             for j in range(0, args.mismatchTolerance + 1):
                 for k in range(0, len(self.targetList[i].matches[j])):
@@ -1041,8 +1266,15 @@ class TargetSelection(object):  #This is the main running object for the target 
                         
     def cleanup(self):
         import shutil
-        shutil.rmtree(self.tempDir)
-                        
+        import time
+        try:
+            shutil.rmtree(self.tempDir)
+        except OSError:
+            time.sleep(5)
+            try:
+                shutil.rmtree(self.tempDir)
+            except OSError:
+                print("Error removing working folder " + self.tempDir + " please remove manually.")
 
 #=================================================Azimuth analysis object==================================================================================================================
 
@@ -1498,6 +1730,10 @@ class MatchSite(object):  #Note that this is also used when we unpickle this obj
             self.mismatchRisk = args.mismatchTolerance + 2 - self.mismatches
             if self.gene:
                 self.mismatchRisk = self.mismatchRisk ** 2
+            if args.preferredPAMWeight:
+                pamLength = len(args.sequence.split("_")[1])
+                if self.matchSeq[-pamLength:] in args.preferredPAMList:
+                    self.mismatchRisk = self.mismatchRisk * args.preferredPAMWeight
             return self.mismatchRisk
         
     def __str__(self):  #quick way to output the info on the match site
@@ -1520,6 +1756,7 @@ class MatchSite(object):  #Note that this is also used when we unpickle this obj
 class SearchSupervisor(object):
     
     def __init__(self):
+        import os
         if not args.forceGenome:
             printStartUp()
             reportUsage("SEARCH") 
@@ -1527,6 +1764,11 @@ class SearchSupervisor(object):
         else:
             genomeDirectory = args.forceGenome
             pam, sequence, self.species = genomeDirectory.split(".")
+        if args.mixed:
+            try:
+                print("Testing sequence " + args.sequence + " on " + os.environ["HOSTNAME"])
+            except KeyError:
+                pass
         self.genomeDirectory = args.genomeListDirectory + genomeDirectory
         self.createTempDir()
         print("Creating job list")
@@ -1608,13 +1850,16 @@ class SearchSupervisor(object):
     def findTargetsInTree(self):
         import pickle
         import os
+        import datetime
         targetFiles = []  #initiate an empty list to store our good targetfiles
         try:
             treeFile = open(self.genomeDirectory + os.sep + "tree.pkl", "rb")
         except FileNotFoundError:
             raise RuntimeError("The tree structure file for this genome was not found.  Please run the indexer with the recreate tree option to correct this problem.")
         print("Loading tree structure.")
+        startTree = datetime.datetime.now()
         tree = pickle.load(treeFile)
+        print("Tree loaded in " + str(datetime.datetime.now() - startTree))
         treeFile.close()
         level1 = list(tree.keys())
         seed1Length = len(level1[0])
@@ -1699,10 +1944,14 @@ class SearchSupervisor(object):
         
     def createJobBash(self,jobID):
         self.bash = self.tempDir + "/" + str(jobID) + ".sh"
+        if args.useArray:
+            delayIO = " --delayIO"
+        else:
+            delayIO = ""
         bashFile = open(self.bash, 'w')
         bashFile.write("#! /bin/bash\n")
-        #bashFile.write("module load python/3.4\n")
-        bashFile.write(pythonInterpreterAbsolutePath + " dsNickFury" + currentVersion + ".py --mode worker --workerID " + str(jobID) + " --mismatchTolerance " + str(args.mismatchTolerance) + " --sequence " + args.sequence + " --inputDirectory " + self.genomeDirectory + " --tempDir " + self.tempDir + " --genomeDirectory " + args.genomeListDirectory.replace(" ",'\ ') + "\n")
+        bashFile.write(pythonInterpreterAbsolutePath + " dsNickFury" + currentVersion + ".py --mode worker --workerID " + str(jobID) + delayIO + " --mismatchTolerance " + str(args.mismatchTolerance) + " --sequence " + args.sequence + " --inputDirectory " + self.genomeDirectory + " --tempDir " + self.tempDir + " --genomeDirectory " + args.genomeListDirectory.replace(" ",'\ ') + "\n")
+        #bashFile.write(pythonInterpreterAbsolutePath + " -m cProfile dsNickFury" + currentVersion + ".py --mode worker --workerID " + str(jobID) + " --mismatchTolerance " + str(args.mismatchTolerance) + " --sequence " + args.sequence + " --inputDirectory " + self.genomeDirectory + " --tempDir " + self.tempDir + " --genomeDirectory " + args.genomeListDirectory.replace(" ",'\ ') + "\n")  #uncomment this line and comment the above to allow for code profiling.  This usually causes pickle error, but can help diagnose performance problems.
         bashFile.close()
     
     def submitJob(self, jobID):
@@ -1723,9 +1972,10 @@ class SearchSupervisor(object):
                         submitted = True
             else:
                 print ("MOCK SUBMIT: " + command)
-        if args.standAlone:
+        if args.standAlone or args.mixed:
             command = "bash " + self.bash
             if not args.mock:
+                import time
                 import subprocess
                 subprocess.Popen(command, shell = True)
             else:
@@ -1775,6 +2025,7 @@ class SearchSupervisor(object):
         import urllib.request
         import time
         import json
+        import random
         begin = int(site.begin) - expand
         end = int(site.end) + expand
         urlBase = 'http://rest.ensembl.org/overlap/region/' + self.species + '/'
@@ -1782,7 +2033,7 @@ class SearchSupervisor(object):
         urlArguments = "?feature=gene;content-type=application/json"
         fullURL = urlBase + urlLocus + urlArguments
         try:
-            ensembl = urllib.request.urlopen(fullURL)
+            ensembl = urllib.request.urlopen(fullURL, timeout = 5)  #setting a timeout to avoid getting bogged down in bad requests
             ensembl = ensembl.read().decode('utf-8')
             ensembl = json.loads(ensembl)
         except urllib.error.HTTPError as error:
@@ -1796,18 +2047,18 @@ class SearchSupervisor(object):
                 return "Unable to get annotation.  Error code: " + str(error.code) + " FullURL = " + fullURL
         except urllib.error.URLError:
             if not failedPrevious:
-                time.sleep(5)
+                time.sleep(random.uniform(1,10))
                 return self.getAnnotation(site, expand, True)
             else:
                 print("Unable to reach/find ensembl server.  Please confirm you are connected to the internet.")
                 return "Unable to contact ensembl. (URL/network error)"
-        except http.client.HTTPException as error:
+        except Exception as error:
             if not failedPrevious:
                 time.sleep(5)
                 return self.getAnnotation(site, expand, True)
             else:
                 print("Got bad status line trying to pull up " + fullURL)
-                print("Response: " + error.read().decode('utf-8'))
+                print("Response: " + str(error))
                 return "Unable to get annotation due to BadStatusCode error.  Matching " + args.sequence
         gene = False
         for item in ensembl:
@@ -1819,22 +2070,17 @@ class SearchSupervisor(object):
         totalMatches = 0  #First we check to determine if we have a reasonable number of sites.  If it is too high, we won't bother annotating gene info, as that will seriously degrade performance for a site nobody would want to use.
         for key in list(self.matches.keys()):  #Seriously, I learned this one the hard way, having unintentionally found a CRISPR target with about 7000 potential off-targets
             totalMatches += len(self.matches[key])  #It took over an hour just to make all the Ensembl server calls.  It was brutal and kept timing out the job for a site nobody would ever use.
-        if totalMatches > args.mismatchTolerance * 100 and not args.clobber:
+        if (totalMatches > args.mismatchTolerance * 20) and not args.clobber:
             for key in list(self.matches.keys()):
                 for i in range(0,len(self.matches[key])):
                     self.matches[key][i].tooManyOtherSites = totalMatches
-            return True #Get us out of here before we bother annotating this terrible, terrible site.  Otherwise we'll be at it forever.
-        for key in list(self.matches.keys()):
-            for i in range(0,len(self.matches[key])):
-                self.matches[key][i].gene = self.getAnnotation(self.matches[key][i])
-        for key in list(self.matches.keys()):
-            for i in range(0,len(self.matches[key])):
-                if not self.matches[key][i].gene:
-                    self.matches[key][i].gene = self.getAnnotation(self.matches[key][i], args.annotationExpansion // 10)
-        for key in list(self.matches.keys()):
-            for i in range(0,len(self.matches[key])):
-                if not self.matches[key][i].gene:
-                    self.matches[key][i].gene = self.getAnnotation(self.matches[key][i], args.annotationExpansion)
+        else:
+            for i in range(0,len(self.matches[0])):  #only look for precise sites with our perfet matches, everything else we can just run the expanded set
+                self.matches[0][i].gene = self.getAnnotation(self.matches[0][i])
+            for key in list(self.matches.keys()):
+                for i in range(0,len(self.matches[key])):
+                    if not self.matches[key][i].gene:
+                        self.matches[key][i].gene = self.getAnnotation(self.matches[key][i], args.annotationExpansion)
             
     def reportResults(self):
         for i in range(0,args.mismatchTolerance + 1):
@@ -1912,65 +2158,196 @@ class WorkerJob(object):
                 colorScheme.append(str(red) + ",0," + str(blue))
         return colorScheme
         
-    def checkAllSequences(self):
+    def checkAllSequences(self):  #original method
         progress = 0
+        allFiles = []
+        if args.delayIO and standAloneDefaultSelectionModeParallelJobLimit > 1:
+            import random
+            import time
+            randomBreak = random.uniform(0, standAloneDefaultSelectionModeParallelJobLimit)
+            print("Delaying reads by " + str(randomBreak) + " seconds.")
+            time.sleep(randomBreak)
         for fileData in self.fileList:
+            print("Read " + str(progress) + " of " + str(len(self.fileList)) + " files.           ", end = "\r")
+            progress += 1
             fileName, binMismatches, startIndex = fileData.split(":")  #the last two values will come in as strings, but need to be used as ints
             binMismatches = int(binMismatches)
             startIndex = int(startIndex)
             file = open(args.inputDirectory + "/" + fileName, 'r')
             wholeFile = file.read()
             file.close()
-            wholeFile = wholeFile.split("\n")
-            for line in wholeFile:
-                if line:
-                    mismatches = binMismatches #initialize this counter to however many mismatches we got during our tree search
-                    if line.count("\t") == 5:
-                        chrom, begin, end, extendedSeq, score, strand = line.split("\t")
-                    elif line.count("\t") == 4:
-                        chrom, begin, end, extendedSeq, strand = line.split("\t")
-                    else:
-                        raise RuntimeError("Got an inappropriate number of tabs on this line: " + line)
-                    refSeq, beforeStart, afterPam = extendedSeq.split("/")
-                    pam, guide = refSeq.split("_")
-                    for i in range(startIndex,len(self.guide)):
-                        try:
-                            if guide[i] != self.guide[i]:
-                                mismatches += 1
-                                if mismatches > args.mismatchTolerance:
-                                    break
-                        except IndexError:
-                            raise RuntimeError("ABORTED: Encountered an error reading " + fileName + " where we got an error comparing input sequence " + self.guide + " to " + guide + ".  This could be due to a corrupted, shortened sequence in the data file, or a bug in the program.")
-                        extendedRefGuide = beforeStart + guide[::-1]
-                        extendedGuide = extendedRefGuide[-(len(beforeStart) + len(self.guide))]
-                        extendedPam = pam[::-1] + afterPam
-                        extendedSiteSeq = extendedGuide + extendedPam
-                        if i == len(self.guide) - 1:
-                            mismatchSites = []  #find the position in the guide of all mismatches, indexed to the base right before the PAM being [0]
-                            for j in range(0,len(self.guide)):
-                                if guide[j] != self.guide[j]:
-                                    mismatchSites.append(j)
-                                    if len(mismatchSites) == mismatches:  #once we have a number of mismatch index values equal to our number of mismatches, we can stop
-                                        break                            
-                            matchGuide = guide[:len(guide)]
-                            matchGuide = matchGuide[::-1]
-                            matchSeq = matchGuide + pam[::-1]
-                            matchSeqExtended = matchSeq
-                            guideDiff = len(guide) - len(self.guide) #accounting for a longer guide sequence in the stored reference
-                            if guideDiff != 0:
-                                matchSeq = matchSeq[guideDiff:]
-                                if strand == "+":
-                                    begin = str(int(begin) + guideDiff)
-                                if strand == "-":
-                                    end = str(int(end) - guideDiff)
-                            
-                            self.matchTable[mismatches].append(MatchSite(chrom, begin, end, matchSeq, str(1000*((len(guide)-mismatches)/len(guide))), strand, self.colorScheme[mismatches], mismatches, extendedSiteSeq, mismatchSites))
-                            if args.verbose:
-                                print("\nFound Match")
-                    progress += 1
-                    if progress % 1000 == 0 and (args.verbose or args.workerID == "0"):
-                        print("Processed " + str(progress) + " lines", end = "\r")
-        print("Processed " + str(progress) + " lines")
+            lines = wholeFile.split("\n")
+            for line in lines:
+                allFiles.append([line, int(binMismatches)])
+        print("All files read.                                      ")
+        progress = 0
+        totalLines = len(allFiles)
+        for lineMismatchCombo in allFiles:
+            if lineMismatchCombo[0]:
+                line = lineMismatchCombo[0]
+                mismatches = lineMismatchCombo[1] #initialize this counter to however many mismatches we got during our tree search
+                if line.count("\t") == 5:
+                    chrom, begin, end, extendedSeq, score, strand = line.split("\t")
+                elif line.count("\t") == 4:
+                    chrom, begin, end, extendedSeq, strand = line.split("\t")
+                else:
+                    raise RuntimeError("Got an inappropriate number of tabs on this line: " + line)
+                refSeq, beforeStart, afterPam = extendedSeq.split("/")
+                pam, guide = refSeq.split("_")
+                for i in range(startIndex,len(self.guide)):
+                    try:
+                        if guide[i] != self.guide[i]:
+                            mismatches += 1
+                            if mismatches > args.mismatchTolerance:
+                                break
+                    except IndexError:
+                        raise RuntimeError("ABORTED: Encountered an error reading " + fileName + " where we got an error comparing input sequence " + self.guide + " to " + guide + ".  This could be due to a corrupted, shortened sequence in the data file, or a bug in the program.")
+                    extendedRefGuide = beforeStart + guide[::-1]
+                    extendedGuide = extendedRefGuide[-(len(beforeStart) + len(self.guide))]
+                    extendedPam = pam[::-1] + afterPam
+                    extendedSiteSeq = extendedGuide + extendedPam
+                    if i == len(self.guide) - 1:
+                        mismatchSites = []  #find the position in the guide of all mismatches, indexed to the base right before the PAM being [0]
+                        for j in range(0,len(self.guide)):
+                            if guide[j] != self.guide[j]:
+                                mismatchSites.append(j)
+                                if len(mismatchSites) == mismatches:  #once we have a number of mismatch index values equal to our number of mismatches, we can stop
+                                    break                            
+                        matchGuide = guide[:len(guide)]
+                        matchGuide = matchGuide[::-1]
+                        matchSeq = matchGuide + pam[::-1]
+                        matchSeqExtended = matchSeq
+                        guideDiff = len(guide) - len(self.guide) #accounting for a longer guide sequence in the stored reference
+                        if guideDiff != 0:
+                            matchSeq = matchSeq[guideDiff:]
+                            if strand == "+":
+                                begin = str(int(begin) + guideDiff)
+                            if strand == "-":
+                                end = str(int(end) - guideDiff)
+                        
+                        self.matchTable[mismatches].append(MatchSite(chrom, begin, end, matchSeq, str(1000*((len(guide)-mismatches)/len(guide))), strand, self.colorScheme[mismatches], mismatches, extendedSiteSeq, mismatchSites))
+                        if args.verbose:
+                            print("\nFound Match")
+                progress += 1
+                if progress % 10000 == 0 and (args.verbose or args.workerID == "0"):
+                    print("Processed " + str(progress) + " of " + str(totalLines) + " lines.            ", end = "\r")
+        print("Processed " + str(progress) + " lines.                     ")
+        
+    # def checkAllSequencesVectorized(self):  #Saving this for later, not much more efficient in python, may be faster in C
+    #     progress = 0
+    #     allFiles = ""
+    #     if args.delayIO and standAloneDefaultSelectionModeParallelJobLimit > 1:
+    #         import random
+    #         import time
+    #         randomBreak = random.uniform(0, standAloneDefaultSelectionModeParallelJobLimit)
+    #         print("Delaying reads by " + str(randomBreak) + " seconds.")
+    #         time.sleep(randomBreak)
+    #     for fileData in self.fileList:
+    #         print("Read " + str(progress) + " of " + str(len(self.fileList)) + " files.           ", end = "\r")
+    #         progress += 1
+    #         fileName, binMismatches, startIndex = fileData.split(":")  #the last two values will come in as strings, but need to be used as ints
+    #         binMismatches = int(binMismatches)
+    #         startIndex = int(startIndex)
+    #         file = open(args.inputDirectory + "/" + fileName, 'r')
+    #         wholeFile = file.read()
+    #         file.close()
+    #         if not wholeFile.endswith("\n"):
+    #             wholeFile += "\n"
+    #         allFiles += wholeFile
+    #     print("All files read.                                      ")
+    #     progress = 0
+    #     totalLines = allFiles.count("\n")
+    #     matchedLines = ""
+    #     lineBuffer = ""
+    #     lineBufferIndex = 0
+    #     mismatches = 0
+    #     disqualified = False
+    #     matching = False
+    #     qualified = False
+    #     targetIndex = 0
+    #     bases = "ATGC"
+    #     i = 0
+    #     while allFiles[i] != "_":
+    #         i += 1
+    #     guideDivide = 0
+    #     i += 1
+    #     while allFiles[i] != "_":
+    #         i += 1
+    #         guideDivide += 1
+    #     i = 0
+    #     while i < len(allFiles):
+    #         #if i % 100000 == 0:
+    #         #    print("Matching " + str(int((i/len(allFiles))*100)) + " percent complete.        ", end = "\r")
+    #         if allFiles[i] != "_":
+    #             i += 1
+    #             continue
+    #         else:
+    #             i += 1
+    #             targetIndex = 0
+    #             while not disqualified and targetIndex < len(self.guide):
+    #                 if allFiles[i] != self.guide[targetIndex]:
+    #                     mismatches +=1
+    #                     if mismatches > args.mismatchTolerance:
+    #                         disqualified = True
+    #                 targetIndex += 1
+    #                 i += 1
+    #             if disqualified:
+    #                 disqualified = False
+    #                 jump = guideDivide - 6 - targetIndex  #subtracting 5 just in case there are contigs with very long names that I don't know about.
+    #                 mismatches = 0
+    #                 targetIndex = 0
+    #                 i += jump
+    #                 continue
+    #             else:
+    #                 i -= 1
+    #                 while allFiles[i] != "\n":
+    #                     i -= 1
+    #                 i += 1
+    #                 while allFiles[i] != "\n":
+    #                     lineBuffer += allFiles[i]
+    #                     i += 1
+    #                 matchedLines += lineBuffer + "|" + str(mismatches) + "\n"
+    #                 mismatches = 0
+    #                 lineBuffer = ""
+    #                 targetIndex = 0
+    #                 i += 1
+    #                 continue
+    #     print("Matching complete, collecting similar sites.")
+    #     matchedLines = matchedLines.split("\n")
+    #     if not matchedLines[-1]:  #Because the string will end with an endline character, it will most likely create an empty field at the end of the list.  Get rid of it now before it causes all manner of trouble.
+    #         print("Dropping an empty last element on list")
+    #         del matchedLines[-1]
+    #     for i in range(0, len(matchedLines)):
+    #         matchedLines[i] = matchedLines[i].split("|")
+    #         matchedLines[i][1] = int(matchedLines[i][1])
+    #         matchedLines[i][0] = matchedLines[i][0].split("\t")
+    #     for line in matchedLines:
+    #         data, mismatches = line
+    #         if len(data) == 6:
+    #             chrom, begin, end, extendedSeq, score, strand = data
+    #         elif len(data) == 5:
+    #             chrom, begin, end, extendedSeq, strand = data
+    #         else:
+    #             raise RuntimeError("Got an inappropriate number of tabs on this line: " + line)
+    #         refSeq, beforeStart, afterPam = extendedSeq.split("/")
+    #         pam, guide = refSeq.split("_")
+    #         extendedRefGuide = beforeStart + guide[::-1]
+    #         extendedGuide = extendedRefGuide[-(len(beforeStart) + len(self.guide))]
+    #         extendedPam = pam[::-1] + afterPam
+    #         extendedSiteSeq = extendedGuide + extendedPam
+    #         mismatchSites = [] #THIS WOULD BE A GOOD PLACE TO TRACK MISMATCHES, IF NEEDED                            
+    #         matchGuide = guide
+    #         matchGuide = matchGuide[::-1]
+    #         matchSeq = matchGuide + pam[::-1]
+    #         guideDiff = len(guide) - len(self.guide) #accounting for a longer guide sequence in the stored reference
+    #         if guideDiff != 0:
+    #             matchSeq = matchSeq[guideDiff:]
+    #             if strand == "+":
+    #                 begin = str(int(begin) + guideDiff)
+    #             if strand == "-":
+    #                 end = str(int(end) - guideDiff)
+    #         self.matchTable[mismatches].append(MatchSite(chrom, begin, end, matchSeq, str(1000*((len(guide)-mismatches)/len(guide))), strand, self.colorScheme[mismatches], mismatches, extendedSiteSeq, mismatchSites))
+    #     print("Processed " + str(progress) + " lines.                     ")
                             
     def reportResult(self):
         if args.workerID == "0":
@@ -2062,7 +2439,7 @@ class FASTASupervisor(object):
                 if args.cluster:
                     while len(self.parallelJobs) > args.maxParallelJobs:
                         print("WARNING: Current chunk size generated too many parallel jobs.  Increasing chunk size by 50% and trying again.")
-                        args.chunkSize = args.chunkSize * 1.5
+                        args.chunkSize = int(args.chunkSize * 1.5)
                         self.createParallelJobs()
                     self.assignParallelJobs()
                     self.monitorJobs()
@@ -2161,6 +2538,7 @@ class FASTASupervisor(object):
         
     def createParallelJobs(self):
         contigData = []
+        self.fai.seek(0)
         rawLine = self.fai.readline()
         while rawLine:
             line = FASTAIndexLine(rawLine)
@@ -2168,7 +2546,9 @@ class FASTASupervisor(object):
             rawLine = self.fai.readline()
         self.contigList = []
         for line in contigData:
-            self.contigList.append(str(line.contig))        
+            self.contigList.append(str(line.contig))
+        if len(self.contigList) > args.maxParallelJobs:
+            raise RuntimeError("ABORTED: Run cannot proceed with more contigs than allowed parallel jobs.  If you are using a genome version with large numbers of alternate assemblies, you should remove the corresponding lines from your FASTA index file.")
         parallelJobs = []
         windowLength = len(args.sequence) - 1  #the minus 1 accounts for the underscore separating the guide and pam
         for line in contigData:
@@ -2316,7 +2696,7 @@ class FASTASupervisor(object):
                         print("Failed submission.  Waiting 5 seconds and retrying.")
                         time.sleep(5)
             else:
-                print ("MOCK SUBMIT: " + command + " " + arguments)
+                print ("MOCK SUBMIT: " + command)
         if args.standAlone:
             if not workerID:
                 shortName = "NickFury" + job.contig
@@ -2890,5 +3270,5 @@ def main():
         run = bigBinCompiler()
     runTime = datetime.datetime.now() - startTime
     print (args.mode.upper() + " run completed in " + (str(runTime)))
-    
+    quit()
 main()
