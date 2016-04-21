@@ -374,6 +374,7 @@ class Args(object):
                 if not args.preferredPAM.count(",") == 1:
                     raise RuntimeError("PreferredPAM argument can be passed with only one comma-separated value for SITE,PREFERENCEVALUE.  Passed value was " + args.preferredPAM)
                 self.preferredPAM, self.preferredPAMWeight = args.preferredPAM.split(",")
+                self.preferredPAM = self.preferredPAM.upper()
                 try:
                     self.preferredPAMWeight = int(self.preferredPAMWeight)
                 except ValueError:
@@ -388,7 +389,7 @@ class Args(object):
             systemPAMList = NondegenerateBases(systemPAM).permutations()
             self.preferredPAMList = NondegenerateBases(self.preferredPAM).permutations()
             for preferredSite in self.preferredPAMList:
-                if not preferredSite in systemPAMList:
+                if not preferredSite.upper() in systemPAMList:
                     raise RuntimeError("ABORTED: Your preferred PAM site of " + self.preferredPAM + " is not a subset for the system PAMs of " + systemPAM + ".")
         self.useArray = False
         if args.useArray:
@@ -1080,9 +1081,10 @@ class TargetSelection(object):  #This is the main running object for the target 
                 itemSeq, itemGenome, species = item.split(".")
                 if itemGenome == args.genome:
                     itemPam, itemGuide = itemSeq.split("_")
-                    itemPamList = NondegenerateBases(itemPam).permutations()
-                    if (seqPam == itemPam or seqPam in itemPam) and len(seqGuide) <= len(itemGuide):
-                        return item
+                    if len(itemPam) == len(seqPam):
+                        itemPamList = NondegenerateBases(itemPam).permutations()
+                        if (seqPam == itemPam or seqPam in itemPam) and len(seqGuide) <= len(itemGuide):
+                            return item
         raise RuntimeError("ABORTED: Please create an indexed genome for this search.  No suitable indexed genome was found.")
         
     def createTempDir(self):  #makes a temporary directory for this run.  Completions will clock out here and results will be reported back to it.
@@ -1277,6 +1279,7 @@ class TargetSelection(object):  #This is the main running object for the target 
                     
     def gatherResults(self):  #gathers the results from the worker processes (passed via pickle), checks for unacceptable sites (ones that have perfect matches in multiple genomic locations), and calculates mismatch risk numbers
         import pickle
+        printedNoPerfectMatchWarning = False
         for i in range(0,len(self.targetList)):
             totalMismatchRisk = 0
             genesCounted = [] #prevent us from counting multiple hits in the same gene twice
@@ -1291,8 +1294,13 @@ class TargetSelection(object):  #This is the main running object for the target 
                     if site.gene != first:
                         self.targetList[i].acceptable = False
                         break
-            if self.targetList[i].matches[0][0].tooManyOtherSites:    
-                self.targetList[i].tooManyMatches = self.targetList[i].matches[0][0].tooManyOtherSites
+            try:
+                if self.targetList[i].matches[0][0].tooManyOtherSites:    
+                    self.targetList[i].tooManyMatches = self.targetList[i].matches[0][0].tooManyOtherSites
+            except IndexError:
+                if not printedNoPerfectMatchWarning:
+                    print("WARNING: At least one target site did not perfectly match to the genome.  If you are targeting a mutant allele or artificial construct, this is to be expected.  If you are targeting a native sequence, this may indicate an error.  Please manually inspect any perfect matches, as this program assumes the first perfect match for any target is the intended target.")
+                    printedNoPerfectMatchWarning = True
             for j in range(0, args.mismatchTolerance + 1):
                 for k in range(0, len(self.targetList[i].matches[j])):
                     risk = self.targetList[i].matches[j][k].calculateMismatchRisk()
@@ -1935,10 +1943,11 @@ class SearchSupervisor(object):
                 itemSeq, itemGenome, itemSpecies = item.split(".")
                 if itemGenome == args.genome:
                     itemPam, itemGuide = itemSeq.split("_")
-                    itemPamList = NondegenerateBases(itemPam).permutations()
-                    if (seqPam.upper() == itemPam.upper() or seqPam.upper() in itemPamList) and len(seqGuide) <= len(itemGuide):
-                        self.species = itemSpecies.strip().lower()
-                        return item
+                    if len(seqPam) == len(itemPam):
+                        itemPamList = NondegenerateBases(itemPam).permutations()
+                        if (seqPam.upper() == itemPam.upper() or seqPam.upper() in itemPamList) and len(seqGuide) <= len(itemGuide):
+                            self.species = itemSpecies.strip().lower()
+                            return item
         raise RuntimeError("ABORTED: Please create an indexed genome for this search.  No suitable indexed genome was found.")
                 
     def createTempDir(self):
